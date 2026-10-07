@@ -51,6 +51,11 @@ pub fn open(path: &std::path::Path) -> rusqlite::Result<Connection> {
             end        INTEGER NOT NULL,
             UNIQUE(version_id, start)
         );
+        CREATE TABLE IF NOT EXISTS import_id_sequence (
+            name TEXT PRIMARY KEY,
+            -- Number of reserved negative IDs; IDs are i64::MIN + n.
+            next INTEGER NOT NULL
+        );
         "#,
     )?;
     Ok(conn)

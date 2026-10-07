@@ -43,6 +43,30 @@
 
 `segments(start,end)` 为半开区间，按版本隔离并在写入时合并。
 
+### 离线缓存包
+
+离线导出/导入使用独立命令，不经过代理、也不会主动请求上游：
+
+```bash
+cargo run --release --bin cache_pack -- \
+  export --cache-dir ./cache-data --output /tmp/alpha.rcp /obj/alpha
+cargo run --release --bin cache_pack -- \
+  import --cache-dir ./cache-data /tmp/alpha.rcp
+```
+
+包格式为固定 magic + SHA-256 保护的 JSON manifest + 有序 payload 记录：
+
+- 只导出强 ETag 版本；manifest 包含对象 key、ETag、总长度、content-type、
+  last-modified、半开区段边界和每段 SHA-256。
+- payload 没有文件名，只按摘要寻址；导入时先核对路径、强 ETag、长度、
+  blob 长度、总长度、区间排序/边界和每段摘要，全部通过后才进入事务。
+- 新字节先写入临时位置；SQLite 事务提交后再发布新的独立 blob。任何篡改、
+  缺字节、长度不一致或 `%2e%2e` / `..` 穿越路径都会整项拒绝，已有数据库
+  和 blob 不被覆盖。
+- 导入版本使用保留的负数 version id；本机已有同 ETag 但元数据/区段不同会
+  拒绝，完全相同才幂等跳过。导入包只提供历史候选版本，不能改变“普通请求
+  先向上游确认当前强 ETag”的规则。
+
 ## 运行
 
 ```bash
@@ -66,13 +90,15 @@ cargo run --release --bin proxy
 cargo test --features test-support
 ```
 
-- 9 个库单元测试：Range 解析/边界、缺口/合并、ETag 强弱、三种 HTTP-date、
-  If-Range 规则。
-- 12 个端到端集成测试：冷启动全量、重叠区段合并、suffix/开区间尾部、
+- 11 个库单元测试：Range 解析/边界、缺口/合并、ETag 强弱、三种 HTTP-date、
+  If-Range 规则、离线包路径和强 ETag 校验。
+- 18 个端到端集成测试：冷启动全量、重叠区段合并、suffix/开区间尾部、
   bytes=-0 与越界 416、上游忽略 Range（200 提交）、If-Range 强/弱/陈旧、
   同长度对象换版、缓存命中 304 强校验零额外字节、上游 Content-Length 说谎、
   客户端断开取消回源且不落缓存、blob 被截断后不返回短成功响应、
-  allow-list（原始 TCP 报文测穿越/绝对形式 URL/外部重定向）。
+  allow-list（原始 TCP 报文测穿越/绝对形式 URL/外部重定向）、
+  离线包空缓存命中/稀疏区段、上游换版不返回旧字节、字节或元数据篡改整项拒绝、
+  包内穿越路径拒绝。
 
 所有涉及字节的断言都比对实际响应体的 SHA-256 与期望切片摘要，而非仅看
 状态码或响应头。

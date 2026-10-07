@@ -22,7 +22,11 @@ pub struct Env {
 }
 
 pub async fn spawn_env() -> Env {
-    let upstream_base = support::spawn().await; // ends with '/'
+    let upstream_base = support::spawn().await;
+    spawn_env_for_upstream(upstream_base).await
+}
+
+pub async fn spawn_env_for_upstream(upstream_base: String) -> Env {
     let upstream = upstream_base.trim_end_matches('/').to_string();
     let cache_dir = TempDir::new().unwrap();
     let config = ProxyConfig::new(upstream_base.clone(), cache_dir.path().to_path_buf());

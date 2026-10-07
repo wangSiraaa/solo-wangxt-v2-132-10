@@ -3,6 +3,7 @@
 mod common;
 
 use common::*;
+use range_cache_proxy::pack;
 use range_cache_proxy::support;
 
 async fn get(
@@ -577,6 +578,313 @@ async fn only_configured_upstream_is_reachable() {
 }
 
 // ---------------------------------------------------------------------------
+// 12. Offline cache package export/import.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_cache_imports_verified_version_and_revalidates_before_hit() {
+    let src = spawn_env().await;
+    let total = 300_000usize;
+    let expected = support::object_bytes("alpha-v1", total);
+
+    let resp = get(&src, "/obj/alpha", &[]).await;
+    assert_eq!(resp.status(), 200);
+    let package = std::env::temp_dir().join(format!(
+        "range-cache-export-{}-{}.rcp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    pack::export_objects(
+        src.cache_dir.path(),
+        &package,
+        &["/obj/alpha".to_string()],
+    )
+    .unwrap();
+
+    let dst = spawn_env_for_upstream(format!("{}/", src.upstream)).await;
+    reset_stats(&dst).await;
+    let report = pack::import_package(dst.cache_dir.path(), &package).unwrap();
+    assert_eq!(report.imported(), 1);
+    assert_eq!(report.skipped(), 0);
+
+    // The request must still ask upstream. Current upstream is v1, so 304
+    // allows the imported bytes to be served.
+    reset_stats(&dst).await;
+    let resp = get(&dst, "/obj/alpha", &[("Range", "bytes=100-199")]).await;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(hdr(&resp, "etag"), Some("\"alpha-v1\""));
+    assert_eq!(
+        hdr(&resp, "content-range"),
+        Some("bytes 100-199/300000")
+    );
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected[100..200]));
+    let st = stats_for(&dst, "alpha").await;
+    assert_eq!(st["requests"], 1);
+    assert_eq!(st["bytes_sent"], 0);
+
+    // Importing the exact same package again is idempotent and does not replace
+    // or duplicate the existing version.
+    let again = pack::import_package(dst.cache_dir.path(), &package).unwrap();
+    assert_eq!(again.imported(), 0);
+    assert_eq!(again.skipped(), 1);
+    let _ = std::fs::remove_file(package);
+}
+
+#[tokio::test]
+async fn imported_sparse_segments_have_exact_boundaries_and_digests() {
+    let src = spawn_env().await;
+    let expected = support::object_bytes("alpha-v1", 300_000);
+
+    // Establish only two separated ranges.
+    for rh in ["bytes=10-19", "bytes=1000-1099"] {
+        let resp = get(&src, "/obj/alpha", &[("Range", rh)]).await;
+        assert_eq!(resp.status(), 206);
+    }
+    let package = std::env::temp_dir().join(format!(
+        "range-cache-sparse-{}-{}.rcp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    pack::export_objects(
+        src.cache_dir.path(),
+        &package,
+        &["/obj/alpha".to_string()],
+    )
+    .unwrap();
+
+    let dst = spawn_env_for_upstream(format!("{}/", src.upstream)).await;
+    pack::import_package(dst.cache_dir.path(), &package).unwrap();
+
+    for (rh, slice) in [
+        ("bytes=10-19", &expected[10..20]),
+        ("bytes=1000-1099", &expected[1000..1100]),
+    ] {
+        let resp = get(&dst, "/obj/alpha", &[("Range", rh)]).await;
+        assert_eq!(resp.status(), 206);
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(sha256_hex(&body), sha256_hex(slice));
+    }
+    let _ = std::fs::remove_file(package);
+}
+
+#[tokio::test]
+async fn imported_old_version_is_not_returned_after_upstream_changes() {
+    let src = spawn_env().await;
+    let len = 120_000usize;
+    let v0 = support::mutable_bytes(0, len);
+    let resp = get(&src, "/obj/mutable", &[("Range", "bytes=0-99")]).await;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(
+        sha256_hex(&resp.bytes().await.unwrap()),
+        sha256_hex(&v0[0..100])
+    );
+
+    let package = std::env::temp_dir().join(format!(
+        "range-cache-old-{}-{}.rcp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    pack::export_objects(
+        src.cache_dir.path(),
+        &package,
+        &["/obj/mutable".to_string()],
+    )
+    .unwrap();
+
+    let dst = spawn_env_for_upstream(format!("{}/", src.upstream)).await;
+    pack::import_package(dst.cache_dir.path(), &package).unwrap();
+    let roll = dst
+        .client
+        .post(format!("{}/obj/mutable", dst.upstream))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(roll.status(), 200);
+    let v1 = support::mutable_bytes(1, len);
+
+    // The imported interval is covered on disk, but the request must still
+    // revalidate; upstream's 200 means v1 wins.
+    let resp = get(&dst, "/obj/mutable", &[("Range", "bytes=0-99")]).await;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(hdr(&resp, "etag"), Some("\"mutable-v1\""));
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v1[0..100]));
+    assert_ne!(sha256_hex(&body), sha256_hex(&v0[0..100]));
+    let _ = std::fs::remove_file(package);
+}
+
+#[tokio::test]
+async fn tampered_package_bytes_or_metadata_reject_entire_import() {
+    let src = spawn_env().await;
+    let expected = support::object_bytes("alpha-v1", 300_000);
+    let resp = get(&src, "/obj/alpha", &[("Range", "bytes=0-9999")]).await;
+    assert_eq!(resp.status(), 206);
+
+    let base = std::env::temp_dir().join(format!(
+        "range-cache-tamper-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let byte_package = base.with_extension("bytes.rcp");
+    let metadata_package = base.with_extension("meta.rcp");
+    pack::export_objects(
+        src.cache_dir.path(),
+        &byte_package,
+        &["/obj/alpha".to_string()],
+    )
+    .unwrap();
+    std::fs::copy(&byte_package, &metadata_package).unwrap();
+
+    let mut bytes = std::fs::read(&byte_package).unwrap();
+    // Flip a byte in the payload, after the fixed header and JSON manifest.
+    let pos = bytes.len() - 10;
+    bytes[pos] ^= 0x01;
+    std::fs::write(&byte_package, &bytes).unwrap();
+
+    let mut metadata_bytes = std::fs::read(&metadata_package).unwrap();
+    // Replace an object path in the JSON before its manifest digest is read.
+    let needle = b"/obj/alpha";
+    let at = find_subslice(&metadata_bytes, needle).unwrap();
+    metadata_bytes[at + 5] = b'b';
+    std::fs::write(&metadata_package, &metadata_bytes).unwrap();
+
+    for package in [byte_package, metadata_package] {
+        let dst = spawn_env_for_upstream(format!("{}/", src.upstream)).await;
+        assert!(pack::import_package(dst.cache_dir.path(), &package).is_err());
+
+        // Nothing was committed: no object rows, no non-temp blobs and a valid
+        // later request is a normal upstream 206 miss.
+        let conn = rusqlite::Connection::open(dst.cache_dir.path().join("range-cache.sqlite3"))
+            .unwrap();
+        let objects: i64 = conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(objects, 0);
+        let blob_count = std::fs::read_dir(dst.cache_dir.path().join("blobs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("bin"))
+            .count();
+        assert_eq!(blob_count, 0);
+
+        let resp = get(&dst, "/obj/alpha", &[("Range", "bytes=0-49")]).await;
+        assert_eq!(resp.status(), 206);
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(sha256_hex(&body), sha256_hex(&expected[0..50]));
+        let _ = std::fs::remove_file(package);
+    }
+}
+
+#[tokio::test]
+async fn import_does_not_overwrite_a_different_local_same_etag_version() {
+    let src = spawn_env().await;
+    let expected = support::object_bytes("alpha-v1", 300_000);
+    let resp = get(&src, "/obj/alpha", &[]).await;
+    assert_eq!(resp.status(), 200);
+
+    let package = std::env::temp_dir().join(format!(
+        "range-cache-conflict-{}-{}.rcp",
+        std::process::id(),
+        rand_suffix()
+    ));
+    pack::export_objects(
+        src.cache_dir.path(),
+        &package,
+        &["/obj/alpha".to_string()],
+    )
+    .unwrap();
+
+    let dst = spawn_env_for_upstream(format!("{}/", src.upstream)).await;
+    pack::import_package(dst.cache_dir.path(), &package).unwrap();
+    let db = dst.cache_dir.path().join("range-cache.sqlite3");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE versions SET content_type = 'text/plain'
+         WHERE id IN (
+             SELECT v.id FROM versions v
+             JOIN objects o ON o.id = v.object_id
+             WHERE o.path = '/obj/alpha' AND v.etag_tag = 'alpha-v1'
+         )",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(pack::import_package(dst.cache_dir.path(), &package).is_err());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let content_type: String = conn
+        .query_row(
+            "SELECT v.content_type FROM versions v
+             JOIN objects o ON o.id = v.object_id
+             WHERE o.path = '/obj/alpha' AND v.etag_tag = 'alpha-v1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(content_type, "text/plain");
+    let version_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM versions v JOIN objects o ON o.id = v.object_id
+             WHERE o.path = '/obj/alpha'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(version_count, 1);
+
+    let resp = get(&dst, "/obj/alpha", &[("Range", "bytes=0-9")]).await;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(
+        sha256_hex(&resp.bytes().await.unwrap()),
+        sha256_hex(&expected[0..10])
+    );
+    let _ = std::fs::remove_file(package);
+}
+
+#[tokio::test]
+async fn traversal_paths_in_package_are_rejected() {
+    let src = spawn_env().await;
+    let resp = get(&src, "/obj/alpha", &[]).await;
+    assert_eq!(resp.status(), 200);
+    let mut package = std::env::temp_dir().join(format!(
+        "range-cache-traversal-{}.rcp",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    // Build directly in a non-conflicting name so export output can be copied
+    // and its JSON mutated.
+    package.set_extension("orig.rcp");
+    pack::export_objects(
+        src.cache_dir.path(),
+        &package,
+        &["/obj/alpha".to_string()],
+    )
+    .unwrap();
+    let bad_path = package.with_extension("bad.rcp");
+    let mut bytes = std::fs::read(&package).unwrap();
+    let at = find_subslice(&bytes, b"/obj/alpha").unwrap();
+    bytes[at..at + 10].copy_from_slice(b"/obj/../xy");
+    std::fs::write(&bad_path, &bytes).unwrap();
+
+    let dst = spawn_env_for_upstream(format!("{}/", src.upstream)).await;
+    assert!(pack::import_package(dst.cache_dir.path(), &bad_path).is_err());
+    let _ = std::fs::remove_file(package);
+    let _ = std::fs::remove_file(bad_path);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -631,4 +939,14 @@ fn count_versions(env: &Env) -> usize {
 fn count_rows(env: &Env, sql: &str) -> usize {
     let conn = sqlite_conn(env);
     conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap() as usize
+}
+
+fn rand_suffix() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
