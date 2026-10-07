@@ -32,6 +32,28 @@
   （强 ETag / 弱 ETag 拒绝 / HTTP-date）、206 `Content-Range`、416
   `bytes */<length>`。多区间请求透传，不生成 multipart/byteranges。
 
+## 离线缓存包
+
+```bash
+# 从 CACHE_DIR 导出某对象的指定强 ETag 版本（不带 --etag 则导出最新强版本）
+CACHE_DIR=./cache-data cargo run --release --bin proxy -- export-cache \
+  --object /obj/alpha --etag alpha-v1 --out /media/usb/alpha.rcpkg
+
+# 在另一台隔离机器上空缓存导入；导入包不能携带穿越路径
+CACHE_DIR=./cache-data cargo run --release --bin proxy -- import-cache \
+  --input /media/usb/alpha.rcpkg
+```
+
+包内包含对象路径、强 ETag、区段半开区间、总长度、Content-Type/Last-Modified，
+以及每个区段对应字节的 SHA-256；整个清单和载荷再有一个根 SHA-256。导入时逐项
+核对路径、长度、区间边界、覆盖关系、文件实际尺寸、区段摘要和根摘要，字节先写
+`tmp/` 临时稀疏文件，验证完成后才在 SQLite 事务中插入元数据并 rename 到独立 blob。
+
+导入版本标记为 **historical**：它只提供已经验证过的历史字节，不会覆盖本机已有
+版本；即使空缓存导入，普通 Range 请求也仍按既有规则先发条件请求向当前上游确认。
+上游换成不同 ETag 后会提交新版本，绝不返回导入的旧字节。同一对象已有不同版本时
+整包拒绝；完全相同的强 ETag 已存在时幂等跳过且不覆盖本机 blob。
+
 ## 存储布局
 
 ```
@@ -66,13 +88,15 @@ cargo run --release --bin proxy
 cargo test --features test-support
 ```
 
-- 9 个库单元测试：Range 解析/边界、缺口/合并、ETag 强弱、三种 HTTP-date、
-  If-Range 规则。
-- 12 个端到端集成测试：冷启动全量、重叠区段合并、suffix/开区间尾部、
+- 11 个库单元测试：Range 解析/边界、缺口/合并、ETag 强弱、三种 HTTP-date、
+  If-Range 规则、离线包区段与 ETag 校验。
+- 16 个端到端集成测试：冷启动全量、重叠区段合并、suffix/开区间尾部、
   bytes=-0 与越界 416、上游忽略 Range（200 提交）、If-Range 强/弱/陈旧、
   同长度对象换版、缓存命中 304 强校验零额外字节、上游 Content-Length 说谎、
   客户端断开取消回源且不落缓存、blob 被截断后不返回短成功响应、
-  allow-list（原始 TCP 报文测穿越/绝对形式 URL/外部重定向）。
+  allow-list（原始 TCP 报文测穿越/绝对形式 URL/外部重定向）、
+  空缓存导入历史包后按摘要命中、部分区段包、字节/元数据篡改整项拒绝、
+  包内路径穿越拒绝。
 
 所有涉及字节的断言都比对实际响应体的 SHA-256 与期望切片摘要，而非仅看
 状态码或响应头。

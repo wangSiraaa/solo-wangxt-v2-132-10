@@ -20,6 +20,8 @@ pub struct VersionRow {
     /// `None` while only partial segments are known.
     pub total_length: Option<u64>,
     pub content_type: Option<String>,
+    pub created_at: i64,
+    pub historical: bool,
 }
 
 pub fn open(path: &std::path::Path) -> rusqlite::Result<Connection> {
@@ -41,6 +43,7 @@ pub fn open(path: &std::path::Path) -> rusqlite::Result<Connection> {
             last_modified INTEGER,
             total_length INTEGER,
             content_type TEXT,
+            historical  INTEGER NOT NULL DEFAULT 0,
             created_at  INTEGER NOT NULL,
             UNIQUE(object_id, etag_tag)
         );
@@ -53,6 +56,17 @@ pub fn open(path: &std::path::Path) -> rusqlite::Result<Connection> {
         );
         "#,
     )?;
+    // Databases created before offline import lacked this marker.
+    let has_historical: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('versions') WHERE name = 'historical'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_historical == 0 {
+        conn.execute_batch(
+            "ALTER TABLE versions ADD COLUMN historical INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     Ok(conn)
 }
 
@@ -75,6 +89,8 @@ fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<VersionRow> {
         last_modified: r.get("last_modified")?,
         total_length: total.map(|v| v as u64),
         content_type: r.get("content_type")?,
+        created_at: r.get("created_at")?,
+        historical: r.get::<_, i64>("historical")? != 0,
     })
 }
 
@@ -88,7 +104,24 @@ pub fn latest_strong_version(
         "SELECT v.* FROM versions v
          JOIN objects o ON o.id = v.object_id
          WHERE o.path = ?1 AND v.weak = 0
-         ORDER BY v.id DESC LIMIT 1",
+         ORDER BY v.historical ASC, v.created_at DESC, v.id DESC LIMIT 1",
+        params![path],
+        row_from,
+    )
+    .optional()
+}
+
+/// Find a version that this proxy observed from upstream, rather than one
+/// restored only from an offline historical package.
+pub fn find_observed_version(
+    conn: &Connection,
+    path: &str,
+) -> rusqlite::Result<Option<VersionRow>> {
+    conn.query_row(
+        "SELECT v.* FROM versions v
+         JOIN objects o ON o.id = v.object_id
+         WHERE o.path = ?1 AND v.weak = 0 AND v.historical = 0
+         ORDER BY v.created_at DESC, v.id DESC LIMIT 1",
         params![path],
         row_from,
     )
@@ -129,6 +162,7 @@ pub fn insert_partial_version(
         )
         .optional()?
     {
+        tx.execute("UPDATE versions SET historical = 0 WHERE id = ?1", params![existing])?;
         tx.commit()?;
         return Ok(existing);
     }
@@ -162,7 +196,8 @@ pub fn upsert_full_version(
          ON CONFLICT(object_id, etag_tag) DO UPDATE SET
              last_modified = excluded.last_modified,
              total_length   = excluded.total_length,
-             content_type   = excluded.content_type",
+             content_type   = excluded.content_type,
+             historical     = 0",
         params![oid, etag_tag, last_modified, len as i64, content_type],
     )?;
     let id = tx.query_row(
@@ -176,6 +211,49 @@ pub fn upsert_full_version(
         params![id, len as i64],
     )?;
     tx.commit()?;
+    Ok(id)
+}
+
+/// Insert one version restored from an offline package.
+///
+/// The caller has already proven the bytes and hashed each segment. Imported
+/// rows are marked historical: they are never preferred over a version that
+/// this proxy observed directly, even if the packaged version's exported
+/// timestamp happens to be newer. Ordinary requests still revalidate upstream
+/// before serving these bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_historical_version(
+    tx: &mut rusqlite::Transaction<'_>,
+    path: &str,
+    etag_tag: &str,
+    last_modified: Option<i64>,
+    total_length: Option<u64>,
+    content_type: Option<&str>,
+    created_at: i64,
+    segments: &[(u64, u64)],
+) -> rusqlite::Result<i64> {
+    let oid = object_id(tx, path)?;
+    tx.execute(
+        "INSERT INTO versions
+             (object_id, etag_tag, weak, last_modified, total_length, content_type, historical, created_at)
+         VALUES (?1, ?2, 0, ?3, ?4, ?5, 1, ?6)",
+        params![
+            oid,
+            etag_tag,
+            last_modified,
+            total_length.map(|v| v as i64),
+            content_type,
+            created_at,
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO segments(version_id, start, end) VALUES (?1, ?2, ?3)")?;
+        for &(start, end) in segments {
+            stmt.execute(params![id, start as i64, end as i64])?;
+        }
+    }
     Ok(id)
 }
 

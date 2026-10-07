@@ -4,6 +4,7 @@
 #![cfg(feature = "test-support")]
 
 use std::net::SocketAddr;
+use std::path::Path;
 
 use range_cache_proxy::support;
 use range_cache_proxy::ProxyConfig;
@@ -43,6 +44,17 @@ pub async fn spawn_env() -> Env {
         upstream_base,
         cache_dir,
     }
+}
+
+pub async fn spawn_proxy(upstream_base: &str, cache_dir: &Path) -> String {
+    let config = ProxyConfig::new(upstream_base.to_string(), cache_dir.to_path_buf());
+    let (app, _) = range_cache_proxy::build_app(config).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service()).await.unwrap();
+    });
+    format!("http://{addr}")
 }
 
 pub fn sha256_hex(b: &[u8]) -> String {

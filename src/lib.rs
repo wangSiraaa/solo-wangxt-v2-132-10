@@ -9,6 +9,7 @@ pub mod db;
 pub mod error;
 pub mod etag;
 pub mod httpdate;
+pub mod package;
 pub mod proxy;
 pub mod range;
 pub mod store;
